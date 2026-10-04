@@ -14,10 +14,20 @@ final class Fan: ObservableObject {
     @Published var gears = [1700, 2400, 3000, 3700]
     @Published var firmware = ""
     @Published var rgbOn = true
+    @Published var emulatedGear = 0               // gear the firmware refused, run as custom RPM instead
+    @Published var powerLimited = false           // custom target held but the rotor can't reach it
+    @Published var cpuTemp: Double?
+    let sensors = Sensors()
+    var activeGear: Int { realtime ? emulatedGear : gear }
     @Published var autoThermal = UserDefaults.standard.bool(forKey: "autoThermal") {
         didSet { UserDefaults.standard.set(autoThermal, forKey: "autoThermal"); applyThermal() }
     }
-    private var tier = 0                          // cmd 0x07; tier 1 firmware ignores 0x08 gear 4
+    // Firmware answers 0x08 with status 5 for gears its controller tier won't allow
+    // (seen: tier 1 on an Intel MacBook refuses gears 3 and 4). Remember them per connection.
+    private var refusedGears: Set<Int> = []
+    private var pendingGear = 0
+    private var shortfall = 0
+    private var tempSub: Any?
     private var dev: IOHIDDevice?
     private let mgr = IOHIDManagerCreate(kCFAllocatorDefault, 0)
     private let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
@@ -31,28 +41,37 @@ final class Fan: ObservableObject {
         IOHIDManagerOpen(mgr, 0)
         NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification,
                                                object: nil, queue: .main) { [weak self] _ in self?.applyThermal() }
+        tempSub = sensors.$cpu.sink { [weak self] t in
+            DispatchQueue.main.async { self?.cpuTemp = t; self?.applyThermal() }
+        }
     }
 
     private static func from(_ c: UnsafeMutableRawPointer?) -> Fan { Unmanaged<Fan>.fromOpaque(c!).takeUnretainedValue() }
 
     private func attach(_ d: IOHIDDevice) {
         dev = d
+        refusedGears = []
         IOHIDDeviceRegisterInputReportCallback(d, buf, 64, { c, _, _, _, _, r, n in
             if let f = Fan.parse(Array(UnsafeBufferPointer(start: r, count: n))) { Fan.from(c).handle(f.cmd, f.payload) }
         }, Unmanaged.passUnretained(self).toOpaque())
         connected = true
-        for q: UInt8 in [0x01, 0x07, 0x27, 0x25, 0x45] { send(q) }
+        for q: UInt8 in [0x01, 0x27, 0x25, 0x45] { send(q) }
         applyThermal()
     }
 
-    private func detach() { dev = nil; connected = false; realtime = false }
+    private func detach() { dev = nil; connected = false; realtime = false; emulatedGear = 0; powerLimited = false }
 
     private func handle(_ cmd: UInt8, _ p: [UInt8]) {
         func u16(_ i: Int) -> Int { p.count > i + 1 ? Int(p[i]) | Int(p[i + 1]) << 8 : 0 }
         switch cmd {
-        case 0xEF where p.count >= 7: realtime = p[1] & 1 == 1; rpm = u16(3); target = u16(5)
+        case 0xEF where p.count >= 7:
+            realtime = p[1] & 1 == 1; rpm = u16(3); target = u16(5)
+            shortfall = realtime && target > rpm + 400 ? shortfall + 1 : 0   // ~2 reports/s
+            powerLimited = shortfall > 16
         case 0x01 where p.count >= 4: firmware = p[0..<4].map(String.init).joined(separator: ".")
-        case 0x07 where p.count >= 1: tier = Int(p[0])
+        case 0x08 where p.count >= 1:
+            if p[0] != 1 && pendingGear > 0 { refusedGears.insert(pendingGear); emulate(pendingGear) }
+            pendingGear = 0
         case 0x27 where p.count >= 8: gears = (0..<4).map { u16($0 * 2) }
         case 0x25 where p.count >= 1: gear = (1...4).contains(p[0]) ? Int(p[0]) : 0; realtime = p[0] == 5
         case 0x45 where p.count >= 1: rgbOn = p[0] != 0
@@ -90,14 +109,18 @@ final class Fan: ObservableObject {
     // MARK: actions
 
     func setGear(_ g: Int) {
-        if g == 4 && tier == 1 { return setRPM(gears[3]) }
+        if refusedGears.contains(g) { return emulate(g) }
+        pendingGear = g
         send(0x08, [UInt8(g)])
-        gear = g; realtime = false
+        gear = g; realtime = false; emulatedGear = 0
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.send(0x25) }
     }
 
+    private func emulate(_ g: Int) { setRPM(gears[g - 1]); emulatedGear = g }
+
     func setRPM(_ r: Int) {
         let r = min(max(r, 0), 5000)
+        emulatedGear = 0; shortfall = 0; powerLimited = false
         if !realtime { send(0x23) }
         realtime = true
         // A stopped rotor may not spin up at low targets; kick at 1700 first (THRM's wake pulse).
@@ -157,17 +180,30 @@ final class Fan: ObservableObject {
 
     private func abortUpload() { timeout?.cancel(); queue = []; uploading = false }
 
-    // ponytail: maps macOS thermal pressure (4 coarse levels) to gears; a real temp curve needs SMC sensor reads.
+    /// Auto mode: CPU temperature curve with 4 °C hysteresis on the way down; falls back to
+    /// macOS thermal pressure when no SMC temperature is readable.
+    static let autoSteps = [60.0, 72, 84]          // °C at which gear 2, 3, 4 kick in
+
+    static func autoGear(temp t: Double, current: Int) -> Int {
+        let g = 1 + autoSteps.filter { t >= $0 }.count
+        guard (2...4).contains(current), g < current else { return g }
+        return t > autoSteps[current - 2] - 4 ? current : g
+    }
+
     private func applyThermal() {
         guard autoThermal, connected else { return }
         let g: Int
-        switch ProcessInfo.processInfo.thermalState {
-        case .nominal: g = 1
-        case .fair: g = 2
-        case .serious: g = 3
-        default: g = 4
+        if let t = cpuTemp {
+            g = Fan.autoGear(temp: t, current: activeGear)
+        } else {
+            switch ProcessInfo.processInfo.thermalState {
+            case .nominal: g = 1
+            case .fair: g = 2
+            case .serious: g = 3
+            default: g = 4
+            }
         }
-        if realtime || gear != g { setGear(g) }
+        if activeGear != g { setGear(g) }
     }
 
     static func selfTest() {
@@ -184,6 +220,11 @@ final class Fan: ObservableObject {
         precondition(breathe[3] == 1 && breathe[6..<12] == [9, 9, 9, 0, 0, 0])
         let rainbow = lightProgram(.rainbow, [], brightness: 100)
         precondition(rainbow[3] == 5 && rainbow[36..<39] == [255, 255, 0] && rainbow.count == 190)
+        precondition(autoGear(temp: 50, current: 1) == 1 && autoGear(temp: 73, current: 1) == 3)
+        precondition(autoGear(temp: 70, current: 3) == 3 && autoGear(temp: 67, current: 3) == 2 && autoGear(temp: 40, current: 4) == 1)
+        precondition(SMC.decode(SMC.code("sp78"), [0x47, 0x40]) == 71.25)
+        precondition(SMC.decode(SMC.code("flt "), [0x00, 0x00, 0x00, 0x45]) == 2048)
+        precondition(Sensors.label("TC3C").1 == "CPU Core 3" && Sensors.label("TB0T").0 == .battery && Sensors.label("Tzzz").0 == .other)
         print("selftest ok")
     }
 }
@@ -191,6 +232,7 @@ final class Fan: ObservableObject {
 @main
 struct BS3ProApp: App {
     @StateObject private var fan = Fan()
+    @AppStorage("menuTemp") private var menuTemp = true
 
     init() {
         if CommandLine.arguments.contains("--selftest") { Fan.selfTest(); exit(0) }
@@ -198,10 +240,11 @@ struct BS3ProApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            Panel().environmentObject(fan)
+            Panel().environmentObject(fan).environmentObject(fan.sensors)
         } label: {
             Image(systemName: "fan")
-            Text(fan.connected ? "\(fan.rpm)" : "–")
+            Text([menuTemp ? fan.cpuTemp.map { "\(Int($0.rounded()))°" } : nil, fan.connected ? "\(fan.rpm)" : "–"]
+                .compactMap { $0 }.joined(separator: "  "))
         }
         .menuBarExtraStyle(.window)
     }
@@ -214,6 +257,7 @@ struct Panel: View {
     @AppStorage("gearLight") private var gearLight = true
     @AppStorage("powerOn") private var powerOn = false
     @AppStorage("smartStop") private var smartStop = 0
+    @AppStorage("menuTemp") private var menuTemp = true
     @State private var loginItem = SMAppService.mainApp.status == .enabled
     @AppStorage("lightMode") private var lightMode = 0
     @AppStorage("lightRGB") private var lightRGB = 0x0080FF
@@ -238,6 +282,9 @@ struct Panel: View {
                 Text("Not connected. Plug the cooler in over USB.").foregroundStyle(.secondary)
             }
             Divider()
+            TemperaturesView()
+            Divider()
+            Toggle("Show CPU temperature in menu bar", isOn: $menuTemp)
             Toggle("Launch at login", isOn: $loginItem).onChange(of: loginItem) { on in
                 try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
             }
@@ -259,7 +306,12 @@ struct Panel: View {
             Text("\(fan.rpm)").font(.system(size: 32, weight: .semibold, design: .rounded)).monospacedDigit()
             Text("RPM").foregroundStyle(.secondary)
             Spacer()
-            Text(fan.realtime ? "Custom → \(fan.target)" : "Gear \(fan.gear)").foregroundStyle(.secondary)
+            Text(fan.emulatedGear > 0 ? "Gear \(fan.emulatedGear) → \(fan.target)"
+                 : fan.realtime ? "Custom → \(fan.target)" : "Gear \(fan.gear)").foregroundStyle(.secondary)
+        }
+        if fan.powerLimited {
+            Text("Fan can't reach \(fan.target) RPM; the cooler is likely limited by USB power.")
+                .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
         }
         HStack(spacing: 6) {
             ForEach(1...4, id: \.self) { g in
@@ -270,7 +322,7 @@ struct Panel: View {
                     }.frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .tint(!fan.realtime && fan.gear == g ? .accentColor : nil)
+                .tint(fan.activeGear == g ? .accentColor : nil)
             }
         }
         HStack {
@@ -278,7 +330,8 @@ struct Panel: View {
             Text("\(Int(custom))").monospacedDigit().frame(width: 40, alignment: .trailing)
             Button("Set") { fan.autoThermal = false; fan.setRPM(Int(custom)) }
         }
-        Toggle("Auto: follow Mac thermal pressure", isOn: $fan.autoThermal)
+        Toggle(fan.cpuTemp == nil ? "Auto: follow Mac thermal pressure" : "Auto: follow CPU temperature", isOn: $fan.autoThermal)
+            .help("Gear 2 from \(Int(Fan.autoSteps[0]))°, 3 from \(Int(Fan.autoSteps[1]))°, 4 from \(Int(Fan.autoSteps[2]))° C")
         Divider()
         Toggle("RGB lights", isOn: Binding(get: { fan.rgbOn }, set: { fan.setRGB($0) }))
         Picker("", selection: $lightMode) {
@@ -311,6 +364,65 @@ struct Panel: View {
         Picker("Smart start/stop", selection: $smartStop) {
             Text("Off").tag(0); Text("Immediate").tag(1); Text("Delayed").tag(2)
         }.onChange(of: smartStop) { fan.send(0x0D, [UInt8($0)]) }
+    }
+}
+
+struct TemperaturesView: View {
+    @EnvironmentObject var sensors: Sensors
+    @AppStorage("showAllTemps") private var showAll = false
+
+    static func color(_ t: Double) -> Color { t >= 90 ? .red : t >= 75 ? .orange : .primary }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !sensors.available {
+                Text("Temperature sensors unavailable.").foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 0) {
+                    ForEach(sensors.summary(), id: \.0) { name, t in
+                        VStack(spacing: 1) {
+                            Text("\(Int(t.rounded()))°").font(.system(.title3, design: .rounded).weight(.semibold))
+                                .monospacedDigit().foregroundStyle(Self.color(t))
+                            Text(name).font(.caption2).foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity)
+                    }
+                }
+                if !sensors.fans.isEmpty {
+                    HStack {
+                        Image(systemName: "fanblades").foregroundStyle(.secondary)
+                        Text("Mac fans").foregroundStyle(.secondary)
+                        Spacer()
+                        Text(sensors.fans.map { "\($0.rpm)" }.joined(separator: " / ") + " RPM").monospacedDigit()
+                    }.font(.caption)
+                }
+                DisclosureGroup("All sensors", isExpanded: $showAll) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(Sensors.Group.allCases, id: \.self) { g in
+                                if let list = sensors.readings[g], !list.isEmpty {
+                                    Text(g.rawValue).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 2)
+                                    ForEach(list) { r in
+                                        HStack {
+                                            Text(r.name).help(r.id)
+                                            Spacer()
+                                            Text(String(format: "%.1f°", r.value)).monospacedDigit().foregroundStyle(Self.color(r.value))
+                                        }.font(.caption)
+                                    }
+                                }
+                            }
+                            ForEach(sensors.fans) { f in
+                                HStack {
+                                    Text("Mac fan \(f.id + 1)")
+                                    Spacer()
+                                    Text("\(f.rpm) RPM").monospacedDigit()
+                                    Text("(\(f.min)–\(f.max))").foregroundStyle(.secondary)
+                                }.font(.caption)
+                            }
+                        }.padding(.trailing, 8)
+                    }.frame(maxHeight: 260)
+                }.font(.callout)
+            }
+        }
     }
 }
 

@@ -6,7 +6,7 @@ APP=build/BS3Pro.app
 rm -rf build && mkdir -p "$APP/Contents/MacOS"
 
 for arch in arm64 x86_64; do
-  swiftc -O -swift-version 5 -parse-as-library -target $arch-apple-macos13 BS3Pro.swift -o build/BS3Pro-$arch
+  swiftc -O -swift-version 5 -parse-as-library -target $arch-apple-macos13 BS3Pro.swift Sensors.swift -o build/BS3Pro-$arch
 done
 lipo -create build/BS3Pro-arm64 build/BS3Pro-x86_64 -output "$APP/Contents/MacOS/BS3Pro"
 
